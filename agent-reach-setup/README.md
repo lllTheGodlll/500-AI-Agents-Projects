@@ -63,7 +63,7 @@ setup script installs them too.
 |---|---|
 | `agent-reach doctor` | Which channels work and which backend each one uses |
 | `agent-reach check-update` | Is there a newer version? |
-| `bash setup-agent-reach.sh` | Upgrade everything (re-run the setup) |
+| re-run the `curl … \| bash` line (or `bash setup-agent-reach.sh`) | Upgrade everything |
 | `agent-reach skill --uninstall` | Remove the skill from Claude Code |
 | `uv tool uninstall agent-reach` | Remove the CLI |
 
