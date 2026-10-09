@@ -72,32 +72,40 @@ different project.
    *Continue this work in: Codex / agy / Hermes / Claude Code on Ollama / Claude Code via OmniRoute
    / Keep using the current agent.* On your next prompt Claude is told once that a handoff is due.
    It then saves a `handoff:` memory and fills in the narrative of `HANDOFF.md`.
-3. **You pick an agent** (now, or at the second popup at 95%). agentstack refreshes the
-   auto-captured part of `HANDOFF.md` (branch, uncommitted changes, recent commits), opens a new
-   terminal in the repo, and starts the agent with: *read HANDOFF.md, recall shared memory, check
-   the code graph, tell me the next step before changing code.*
+3. **You pick an agent.** Best at the 95% popup, after Claude has written the narrative. If you
+   pick at the first popup, stop Claude first (Esc); the popup warns you when the narrative is still
+   empty. agentstack refreshes the auto-captured part of `HANDOFF.md` (branch, uncommitted changes,
+   recent commits, Claude's last message), opens a new terminal in the repo, and starts the agent
+   with: *read HANDOFF.md, search shared memory for this project's handoff, check the code graph,
+   tell me the next step before changing code.* The note records which agent now owns the repo.
 4. **If you hit the hard limit without switching**, the `StopFailure` hook writes `HANDOFF.md`
    from git and Claude's last message, then shows the picker again.
 5. **The new agent** sees the handoff. Claude Code and Codex get it injected by a SessionStart
    hook; agy and Hermes follow the shared rule "read HANDOFF.md first". It recalls agentmemory and
    queries the same code graph.
-6. **When the task is done**, the agent sets `status: done` in `HANDOFF.md`.
+6. **The old Claude session is blocked** in that repo, so two agents never edit the same files.
+   If you go back to it, a message starting with `reclaim` takes the repo back (or run
+   `agentstack reclaim`). When the new agent writes its own handoff, the block lifts.
+7. **When the task is done**, the agent sets `status: done` in `HANDOFF.md`. The next handoff
+   archives the finished note to `~/.agents/stack/state/handoff-archive/`.
 
 `HANDOFF.md` is added to `.git/info/exclude`, so it never shows up in commits. agentstack never
-touches a `HANDOFF.md` that git already tracks.
+writes, reads or injects a `HANDOFF.md` that git tracks, or one it did not write. A cloned repo
+that ships its own `HANDOFF.md` cannot slip instructions into your agents this way. Even its own
+notes are injected as data ("check this against git"), without the quoted last message.
 
 Watch out: by default Claude Code waits and continues by itself after the limit resets
-(`autoContinueAtUsageLimit`). If you moved the work to another agent, turn that off or close the
-Claude session, so two agents never edit the same files at once.
+(`autoContinueAtUsageLimit`). The playbook turns that off while you use the switcher. The owner
+block covers the next prompt you type, not a turn Claude continues on its own.
 
 ## Hooks that remain after setup
 
 | Agent | Event → what runs |
 |---|---|
-| Claude Code | SessionStart: codebase-memory reminder, agentmemory, agentstack handoff note · UserPromptSubmit: agentmemory capture, agentstack guard (silent unless a handoff is due) · PreToolUse/PostToolUse: codebase-memory context, agentmemory capture · PreCompact/Stop/SessionEnd: agentmemory · StopFailure: agentstack · status line: agentstack (your old status line is kept and shown in front) |
-| Codex | SessionStart: codebase-memory, agentmemory, agentstack · UserPromptSubmit/PreToolUse/PostToolUse/PreCompact/Stop: agentmemory |
+| Claude Code | SessionStart: codebase-memory reminder, agentmemory, agentstack handoff note · UserPromptSubmit: agentmemory capture, agentstack guard (silent unless a handoff is due or the repo was handed away) · PreToolUse/PostToolUse: codebase-memory context, agentmemory capture · PreCompact: agentmemory (captures, and injects up to 1500 tokens of memory) · Stop/SessionEnd: agentmemory · StopFailure: agentstack · status line: agentstack (your old status line is kept and shown in front) |
+| Codex | SessionStart: codebase-memory, agentmemory, agentstack · UserPromptSubmit/PreToolUse/PostToolUse/Stop: agentmemory · PreCompact: agentmemory (injects up to 1500 tokens) |
 | agy | PreInvocation/PreToolUse/PostToolUse/Stop: agentmemory · status line: agentstack (optional) |
-| Hermes | pre_llm_call: codebase-memory · memory provider: agentmemory |
+| Hermes | pre_llm_call: codebase-memory · memory provider: agentmemory (searches memory before every model call and adds the project profile; no off switch while it is the provider) |
 | Removed | Hindsight (Claude, Codex, agy, Hermes provider), ruflo hooks and mods, graphify `hook-guard` and its Codex no-op hook |
 
 ## Services and ports
@@ -117,14 +125,17 @@ Claude session, so two agents never edit the same files at once.
 These are the parts that can cost you an account. Quotes are from the providers' own pages
 (fetched 2026-10-09).
 
-- **Anthropic.** Claude Pro/Max login "is intended exclusively for … ordinary use of Claude Code
-  and other native Anthropic applications", and "developers may not collect, store, or
-  intermediate Claude.ai credentials or session tokens". Enforcement can happen "without prior
-  notice". So: **do not connect your Claude subscription inside OmniRoute** (its `claude`/`cc`
-  providers store the token and imitate the Claude Code client) and do not feed it to other agents.
-  Claude Code on its own login is fine. Claude Code pointed at OmniRoute with an OmniRoute key that
-  routes to other models or to your own Anthropic API key is allowed: unsupported by Anthropic,
-  not forbidden.
+- **Anthropic.** OAuth login "is intended exclusively for purchasers of Claude Free, Pro, Max,
+  Team, and Enterprise subscription plans and is designed to support ordinary use of Claude Code
+  and other native Anthropic applications". Also: "developers may not collect, store, or
+  intermediate Claude.ai credentials or session tokens", and Anthropic may enforce this "without
+  prior notice". So: **do not connect your Claude subscription inside OmniRoute** (its
+  `claude`/`cc` providers store the token and imitate the Claude Code client), and do not feed it
+  to other agents. That includes Hermes's built-in "Anthropic OAuth" login (`hermes model` →
+  Anthropic), which stores your Claude login, routes as Claude Code and bills extra-usage credits.
+  Give Hermes an API key, its own ChatGPT login, OmniRoute or Ollama instead. Claude Code on its
+  own login is fine. Claude Code pointed at OmniRoute with an OmniRoute key that routes to other
+  models or to your own Anthropic API key is allowed: unsupported by Anthropic, not forbidden.
 - **Google Antigravity.** Terms §6: "Using third party software, tools, or services to access the
   Service (e.g. using OpenClaw with Antigravity OAuth) is a breach of this Agreement." Mass
   suspensions happened in February 2026. **Never add your Google login to OmniRoute**
@@ -132,7 +143,11 @@ These are the parts that can cost you an account. Quotes are from the providers'
   login.
 - **OpenAI.** "Sign in with ChatGPT" partners may use your plan (Hermes Agent is a partner).
   OmniRoute's `codex` provider replays Codex's login and OmniRoute's own docs say that session "is
-  not authorized for proxy/router use". Keep Codex on its own login and put API keys in OmniRoute.
+  not authorized for proxy/router use". Its `codex-app-server` provider is a gray area (one
+  personal account at most). Pooling several accounts to stretch limits breaks OpenAI's terms.
+  Keep Codex on its own login and put API keys in OmniRoute. Log Hermes in with its own
+  device-code flow rather than importing `~/.codex/auth.json`: Codex refresh tokens are single use,
+  so a shared copy can log one of them out.
 - **OmniRoute defaults are open.** npm installs listen on all interfaces with no API key, so
   anyone on your Wi-Fi could spend every connected account. The playbook binds it to 127.0.0.1 and
   requires keys. Its `auto` model is pre-wired to free providers that its own catalog flags "avoid".
@@ -142,8 +157,15 @@ These are the parts that can cost you an account. Quotes are from the providers'
 - **agentmemory** sends memory text to whatever LLM key it finds in its environment. If you start
   it from a shell that exports `OPENAI_API_KEY`, your memories go to OpenAI. The launchd service
   here starts it with a clean environment.
-- **Memory is untrusted data.** Anything an earlier session saved can contain prompt injection. The
-  shared rules tell every agent to check memories against the code instead of obeying them.
+- **Memory is untrusted data.** Anything an earlier session saved can contain prompt injection,
+  including a web page an agent fetched (hooks record tool output). Memory also arrives without
+  being asked for: before compaction in Claude and Codex, and on every model call in Hermes. The
+  shared rules tell every agent to treat all of it as data and check it against the code.
+- **API keys never go through chat.** The playbook creates an empty `~/.agents/stack/secrets.env`
+  (mode 600). You paste the keys there in your own editor, and the agent fills config files from
+  it by shell expansion, so keys never appear in the chat, the setup log or a memory.
+- **Backups first.** Phase 1 archives every config file it touches and the agentmemory memory store
+  itself (with the daemon stopped), before any install or upgrade.
 
 ## Decisions you will be asked during setup
 
@@ -151,14 +173,23 @@ These are the parts that can cost you an account. Quotes are from the providers'
 |---|---|---|
 | 1 | Obsidian vault path | your existing vault, else `~/Vaults/AgentBrain` |
 | 2 | ruflo | keep as Claude-only orchestration MCP, memory off (or remove) |
-| 3 | Hindsight | remove hooks and stop the server (or "vault brain" mode, or make it primary instead of agentmemory) |
-| 4 | Local fallback model (by RAM) | ≤16 GB: `qwen3.5` or `gemma4` · 32 GB+: `qwen3-coder:30b` or `gpt-oss:20b` |
+| 3 | Hindsight | remove hooks and stop the server, keeping its data (or "vault brain" mode: search over the vault, no hooks) |
+| 4 | Local fallback model (by RAM) | under 24 GB: no local coding fallback (API models via OmniRoute instead; optionally `qwen3:8b`, weak for coding) · about 24 GB: `gemma4` or `qwen3.5` · 32 GB+: `qwen3-coder:30b` or `gpt-oss:20b` |
 | 5 | Popup thresholds | 85% and 95% of the 5-hour window, 90% of the weekly window |
 | 6 | OmniRoute fallback combo, and what to do with risky connections found | API-key models first, `ollama/<model>` last; remove subscription logins |
 | 7 | Claude auto-continue after the limit resets | off while you use the switcher |
-| 8 | agentmemory auto-injection at session start | off (the handoff note and the "recall first" rule cover it) |
+| 8 | agentmemory auto-injection | at session start: off (the handoff note and the "search first" rule cover it). Before compaction (Claude, Codex, up to 1500 tokens): on, can be set to 0. Hermes provider: always on while it is the provider |
 | 9 | claude-obsidian `hot.md` injection in Claude | off (avoids a third injected block) |
 | 10 | Which repos to index now | the repos you are working on |
+| 11 | Claude's own auto memory (`~/.claude/projects/<p>/memory/`) | keep as a Claude-only cache; the shared rules say durable facts also go to agentmemory |
+
+## Built-in memories of each agent
+
+Each agent also has a private memory that the others cannot read: Claude Code's auto memory (on by
+default), Codex memories (off by default; keep them off), and Hermes's `MEMORY.md`/`USER.md`
+(always on; the agentmemory provider mirrors their writes into agentmemory). They stay as private
+caches. The shared rules tell every agent to save durable facts with `memory_save` too, so a switch
+never loses them.
 
 ## Not verified here (the playbook checks these on your machine)
 
@@ -175,14 +206,20 @@ These are the parts that can cost you an account. Quotes are from the providers'
 - Whether Claude's Stop hooks fire when a session is cut off by the limit (agentmemory's last turn
   may be missing; `HANDOFF.md` covers it).
 - OmniRoute model IDs for your accounts (read them from `GET /v1/models`).
+- That the `AGENTSTACK_OWNER` marker survives `ollama launch claude` into Claude's hooks (the owner
+  block relies on it for Claude sessions agentstack starts).
+- Which folder agy's status line command runs in (its JSON has no documented working-directory
+  field; the agy popup uses the command's own folder).
+- The names `AGENTMEMORY_PRE_COMPACT_BUDGET` and `AGENTMEMORY_CAPTURE_DENY`, and whether the hooks
+  read them from the agent's environment or from agentmemory's `.env`.
 
 ## Files in this folder
 
 | File | What it is |
 |---|---|
 | `SETUP-PLAYBOOK.md` | Step-by-step setup for an agent to execute (Claude Code recommended) |
-| `bin/agentstack` | The glue: status line, hooks, handoff file, picker and launcher, rules/skills sync, install/uninstall, doctor |
-| `tests/test_agentstack.py` | 24 tests on a throwaway HOME (pass on Python 3.9, 3.11, 3.13) |
+| `bin/agentstack` | The glue: status line, hooks, handoff file, owner guard and `reclaim`, picker and launcher, rules/skills sync, install/uninstall, doctor |
+| `tests/test_agentstack.py` | 40 tests on a throwaway HOME (pass on Python 3.9 and 3.13) |
 | `shared/AGENTS.md` | The shared rules every agent gets (`__VAULT__` is filled in at setup) |
 | `shared/skills/agent-handoff/SKILL.md` | Cross-agent skill: write or pick up a handoff |
 | `templates/` | agentmemory `.env`, launchd/systemd service, OmniRoute hardening, Claude/Codex/Hermes fallback profiles |
