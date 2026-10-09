@@ -1,0 +1,1365 @@
+#!/usr/bin/env python3
+"""agentstack: glue for one shared memory stack across Claude Code, Codex, agy, Hermes and Ollama.
+
+Installed at ~/.agents/stack/bin/agentstack. Standard library only, Python 3.9+.
+
+  statusline [--agent claude|agy]   print a status line from the JSON on stdin; when usage crosses a
+                                    threshold, open the agent picker (once per window and threshold)
+  hook prompt-guard                 Claude UserPromptSubmit: note once per session that a handoff is due
+  hook stop-failure                 Claude StopFailure (rate_limit): refresh HANDOFF.md, open the picker
+  hook session-start [--agent A]    Claude/Codex SessionStart: inject an open HANDOFF.md
+  handoff [--cwd D] [--from A] [--reason R]   refresh the auto-captured part of HANDOFF.md
+  switch [--cwd D] [--from A] [--reason R] [--pick C]   pick an agent and open it in a new terminal
+  sync [--check]                    fan ~/.agents/AGENTS.md and ~/.agents/skills out to each agent
+  install|uninstall --agent claude|codex|agy [--dry-run]   add/remove agentstack hooks and status line
+  doctor                            report services, exposure, configs and duplicate hooks
+
+Environment: AGENTSTACK_HOME (default ~/.agents/stack), AGENTSTACK_DRY_RUN=1 (switch writes the
+launcher script but opens nothing), AGENTSTACK_PICK=<choice> (skip the picker), AGENTSTACK_NO_SPAWN=1.
+"""
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+HOME = Path.home()
+STACK = Path(os.environ.get("AGENTSTACK_HOME") or (HOME / ".agents" / "stack"))
+STATE = STACK / "state"
+LOGS = STACK / "logs"
+CONFIG_PATH = STACK / "config.json"
+SELF = Path(__file__).resolve()
+SHARED_RULES = HOME / ".agents" / "AGENTS.md"
+SHARED_SKILLS = HOME / ".agents" / "skills"
+
+BLOCK_BEGIN = "<!-- agent-stack:begin -->"
+BLOCK_END = "<!-- agent-stack:end -->"
+AUTO_BEGIN = "<!-- agent-stack:auto:begin -->"
+AUTO_END = "<!-- agent-stack:auto:end -->"
+HANDOFF_FILE = "HANDOFF.md"
+
+DEFAULTS = {
+    "thresholds_5h": [85, 95],
+    "thresholds_7d": [90],
+    "thresholds_agy": [85, 95],
+    "choices": ["codex", "agy", "hermes", "claude-ollama", "claude-omniroute", "codex-omniroute"],
+    "terminal": "auto",
+    "ollama_model": "qwen3-coder:30b",
+    "omniroute_settings": "~/.claude/omniroute.settings.json",
+    "codex_omniroute_profile": "omniroute",
+    "continue_same_session": False,
+    "agy_prompt_flag": "",
+    "agentmemory_url": "http://localhost:3111",
+    "agentmemory_remember": True,
+    "handoff_max_age_hours": 72,
+    "request_max_age_hours": 6,
+    "statusline_chain": {},
+    "claude_skip_skills": [],
+    "agy_skip_skills": [],
+    "agy_skills_mode": "symlink",
+    "launch_env": {},
+    "resume_prompt": (
+        "Continue the work in this repository (project: {project}). Start by reading HANDOFF.md at "
+        "the repo root. Then load context from shared memory (agentmemory: memory_smart_search or "
+        "memory_recall for project '{project}') and from the code graph (codebase-memory-mcp). "
+        "Tell me what you found and the next step before you change code."
+    ),
+}
+
+LABELS = {
+    "codex": "Codex CLI",
+    "agy": "Antigravity CLI (agy)",
+    "hermes": "Hermes Agent",
+    "claude-ollama": "Claude Code on local Ollama",
+    "claude-omniroute": "Claude Code via OmniRoute (API-key models)",
+    "codex-omniroute": "Codex via OmniRoute (API-key models)",
+    "keep": "Keep using the current agent",
+}
+
+
+# ---------------------------------------------------------------------------------------------
+# small helpers
+
+
+def now_iso():
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def log(msg):
+    try:
+        LOGS.mkdir(parents=True, exist_ok=True)
+        with open(LOGS / "agentstack.log", "a", encoding="utf-8") as fh:
+            fh.write("%s %s\n" % (now_iso(), msg))
+    except OSError:
+        pass
+
+
+def expand(path):
+    return Path(os.path.expanduser(os.path.expandvars(str(path))))
+
+
+def load_config():
+    cfg = json.loads(json.dumps(DEFAULTS))
+    try:
+        user = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        if isinstance(user, dict):
+            cfg.update(user)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as exc:
+        log("config unreadable, using defaults: %s" % exc)
+    return cfg
+
+
+def save_config_key(key, value):
+    try:
+        current = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        if not isinstance(current, dict):
+            current = {}
+    except (OSError, ValueError):
+        current = {}
+    current[key] = value
+    write_json(CONFIG_PATH, current)
+
+
+def read_json(path):
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def write_json(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    os.replace(str(tmp), str(path))
+
+
+def write_text_atomic(path, text):
+    path = Path(path)
+    tmp = path.with_name(path.name + ".agentstack-tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(str(tmp), str(path))
+
+
+def backup(path):
+    path = Path(path)
+    if path.exists():
+        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        dest = path.with_name("%s.bak-agentstack-%s" % (path.name, stamp))
+        shutil.copy2(str(path), str(dest))
+        return dest
+    return None
+
+
+def run(cmd, cwd=None, timeout=5, stdin_text=None):
+    try:
+        proc = subprocess.run(
+            cmd, cwd=cwd, input=stdin_text, capture_output=True, text=True, timeout=timeout
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 127, "", str(exc)
+
+
+def which(name):
+    return shutil.which(name) is not None
+
+
+def num(value):
+    try:
+        if value is None or isinstance(value, bool):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def slug(text):
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", str(text)).strip("-")[:80] or "none"
+
+
+def read_stdin_json():
+    try:
+        if sys.stdin is None or sys.stdin.isatty():
+            return {}, ""
+        raw = sys.stdin.read()
+    except (OSError, ValueError):
+        return {}, ""
+    if not raw.strip():
+        return {}, raw
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return {}, raw
+    return (value if isinstance(value, dict) else {}), raw
+
+
+def emit_context(event, text):
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}}))
+
+
+def git_root(cwd):
+    cwd = str(cwd or os.getcwd())
+    code, out, _ = run(["git", "-C", cwd, "rev-parse", "--show-toplevel"])
+    if code == 0 and out.strip():
+        return Path(out.strip())
+    return Path(cwd)
+
+
+def is_git(root):
+    code, _, _ = run(["git", "-C", str(root), "rev-parse", "--git-dir"])
+    return code == 0
+
+
+def project_name(root):
+    # Same rule agentmemory's hooks use: env override, else the git toplevel folder name.
+    return os.environ.get("AGENTMEMORY_PROJECT_NAME") or Path(root).name
+
+
+def spawn_self(argv):
+    if os.environ.get("AGENTSTACK_NO_SPAWN") == "1":
+        log("spawn suppressed: %s" % " ".join(argv))
+        return
+    LOGS.mkdir(parents=True, exist_ok=True)
+    with open(LOGS / "agentstack.log", "a", encoding="utf-8") as fh:
+        subprocess.Popen(
+            [sys.executable, str(SELF)] + argv,
+            stdin=subprocess.DEVNULL,
+            stdout=fh,
+            stderr=fh,
+            start_new_session=True,
+            close_fds=True,
+        )
+
+
+def notify(message):
+    if sys.platform == "darwin" and which("osascript"):
+        run(["osascript", "-e", "display notification %s with title \"agent-stack\"" % aq(message)])
+    elif which("notify-send"):
+        run(["notify-send", "agent-stack", message])
+    log("notify: %s" % message)
+
+
+def aq(text):
+    """Quote a string for AppleScript."""
+    return '"' + str(text).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def copy_to_clipboard(text):
+    for cmd in (["pbcopy"], ["wl-copy"], ["xclip", "-selection", "clipboard"]):
+        if which(cmd[0]):
+            code, _, _ = run(cmd, stdin_text=text)
+            if code == 0:
+                return True
+    return False
+
+
+# ---------------------------------------------------------------------------------------------
+# status line
+
+
+def claude_usage(data, cfg):
+    rate = data.get("rate_limits") or {}
+    five = rate.get("five_hour") or {}
+    seven = rate.get("seven_day") or {}
+    p5, p7 = num(five.get("used_percentage")), num(seven.get("used_percentage"))
+    model = (data.get("model") or {}).get("display_name") or ""
+    parts = [model] if model else []
+    windows = []
+    if p5 is not None:
+        parts.append("5h %d%%" % round(p5))
+        windows.append({"name": "5h", "used": p5, "reset": str(five.get("resets_at") or ""),
+                        "thresholds": cfg["thresholds_5h"]})
+    if p7 is not None:
+        parts.append("7d %d%%" % round(p7))
+        windows.append({"name": "7d", "used": p7, "reset": str(seven.get("resets_at") or ""),
+                        "thresholds": cfg["thresholds_7d"]})
+    return " ".join(parts), windows
+
+
+def agy_usage(data, cfg):
+    quota = data.get("quota")
+    buckets = []
+    items = []
+    if isinstance(quota, dict):
+        items = list(quota.items())
+    elif isinstance(quota, list):
+        items = [(b.get("name") or b.get("bucket") or "quota", b) for b in quota if isinstance(b, dict)]
+    for name, bucket in items:
+        if not isinstance(bucket, dict):
+            continue
+        remaining = num(bucket.get("remaining_fraction"))
+        if remaining is None:
+            continue
+        reset = bucket.get("reset_time")
+        if not reset and num(bucket.get("reset_in_seconds")) is not None:
+            # Round to the hour so the key stays stable while the countdown ticks.
+            reset = int((time.time() + num(bucket["reset_in_seconds"])) // 3600)
+        buckets.append((str(name), remaining, str(reset or "")))
+    if not buckets:
+        return "", []
+    name, remaining, reset = min(buckets, key=lambda b: b[1])
+    used = max(0.0, min(100.0, (1.0 - remaining) * 100.0))
+    segment = "agy %s %d%% left" % (name, round(remaining * 100))
+    return segment, [{"name": slug(name), "used": used, "reset": reset, "thresholds": cfg["thresholds_agy"]}]
+
+
+def chained_statusline(cfg, agent, raw):
+    chain = cfg.get("statusline_chain") or {}
+    cmd = chain.get(agent) if isinstance(chain, dict) else None
+    if not cmd:
+        return ""
+    try:
+        proc = subprocess.run(cmd, shell=True, input=raw, capture_output=True, text=True, timeout=3)
+        out = proc.stdout.strip()
+        return out.splitlines()[0] if out else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def maybe_trigger(cfg, agent, windows, cwd, data):
+    root = git_root(cwd)
+    STATE.mkdir(parents=True, exist_ok=True)
+    write_json(STATE / ("usage-%s.json" % agent), {
+        "agent": agent, "updated": now_iso(), "cwd": str(cwd), "repo_root": str(root),
+        "session_id": data.get("session_id") or data.get("conversation_id"),
+        "transcript_path": data.get("transcript_path"), "windows": windows,
+    })
+    crossed = None
+    for window in windows:
+        hits = [t for t in window["thresholds"] if window["used"] >= t]
+        if not hits:
+            continue
+        threshold = max(hits)
+        window_id = window["reset"] or dt.date.today().isoformat()
+        flag = STATE / "fired" / ("%s-%s-%s-%s.flag" % (agent, window["name"], slug(window_id), threshold))
+        if flag.exists():
+            continue
+        flag.parent.mkdir(parents=True, exist_ok=True)
+        flag.write_text(now_iso() + "\n", encoding="utf-8")
+        crossed = (window, threshold)
+    if not crossed:
+        return
+    window, threshold = crossed
+    reason = "%s %s usage %d%% (threshold %d%%)" % (agent, window["name"], round(window["used"]), threshold)
+    write_json(STATE / "handoff-request.json", {
+        "agent": agent, "repo_root": str(root), "reason": reason, "created": now_iso(),
+        "notified_sessions": [],
+    })
+    log("threshold crossed: %s" % reason)
+    spawn_self(["switch", "--cwd", str(root), "--from", agent, "--reason", reason])
+
+
+def cmd_statusline(args):
+    data, raw = read_stdin_json()
+    cfg = load_config()
+    agent = args.agent
+    try:
+        prefix = chained_statusline(cfg, agent, raw)
+        if agent == "agy":
+            segment, windows = agy_usage(data, cfg)
+        else:
+            segment, windows = claude_usage(data, cfg)
+        print(" · ".join(part for part in (prefix, segment) if part) or "agent-stack")
+        sys.stdout.flush()
+        if windows:
+            cwd = (data.get("workspace") or {}).get("current_dir") or data.get("cwd") or os.getcwd()
+            maybe_trigger(cfg, agent, windows, cwd, data)
+    except Exception as exc:  # a status line must never break the agent UI
+        log("statusline error: %r" % exc)
+        print("agent-stack")
+    return 0
+
+
+# ---------------------------------------------------------------------------------------------
+# handoff note
+
+
+def parse_header(text):
+    meta = {}
+    for line in text.splitlines()[:25]:
+        match = re.match(r"^(status|from|updated|reason|project):\s*(.*)$", line.strip())
+        if match:
+            meta[match.group(1)] = match.group(2).strip()
+    return meta
+
+
+HEADER_RE = re.compile(r"^(status|from|updated|reason|project):")
+
+
+def set_header(text, values):
+    """Set `key: value` lines in the header block under the title, adding missing keys."""
+    lines = text.splitlines()
+    for key, value in values.items():
+        line = "%s: %s" % (key, value)
+        found = [i for i, l in enumerate(lines[:25]) if l.strip().startswith(key + ":")]
+        if found:
+            lines[found[0]] = line
+            continue
+        header = [i for i, l in enumerate(lines[:25]) if HEADER_RE.match(l.strip())]
+        if header:
+            lines.insert(header[-1] + 1, line)
+        elif lines and lines[0].startswith("#"):
+            lines[1:1] = ["", line]
+        else:
+            lines.insert(0, line)
+    return "\n".join(lines) + "\n"
+
+
+def handoff_template(project):
+    return (
+        "# Handoff: %s\n\n"
+        "status: open\n\n"
+        "## Narrative\n"
+        "_Written by the agent that is handing off. Replace the blanks:_\n"
+        "- Goal:\n"
+        "- Done so far:\n"
+        "- Remaining:\n"
+        "- Next step (exact command or file):\n"
+        "- How to verify:\n\n"
+        "%s\n%s\n" % (project, AUTO_BEGIN, AUTO_END)
+    )
+
+
+def fenced(text, limit):
+    text = (text or "").strip()
+    if len(text) > limit:
+        text = text[:limit] + "\n…(truncated)"
+    return "~~~~text\n%s\n~~~~" % text.replace("~~~~", "~ ~ ~ ~")
+
+
+def last_assistant_text(transcript_path):
+    """Best effort: the last assistant text block in a Claude Code transcript (format is internal)."""
+    if not transcript_path:
+        return ""
+    path = expand(transcript_path)
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - 400000))
+            lines = fh.read().decode("utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict) or entry.get("type") != "assistant":
+            continue
+        content = (entry.get("message") or {}).get("content")
+        if isinstance(content, str) and content.strip():
+            return content
+        if isinstance(content, list):
+            texts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"]
+            joined = "\n".join(t for t in texts if t.strip())
+            if joined.strip():
+                return joined
+    return ""
+
+
+def auto_section(root, src, reason, last_message, transcript, session_id):
+    project = project_name(root)
+    out = [AUTO_BEGIN, "## Auto-captured state",
+           "_Refreshed by agentstack at %s (from %s: %s). Everything outside this block is kept._"
+           % (now_iso(), src, reason), ""]
+    if is_git(root):
+        def git(*a):
+            code, stdout, _ = run(["git", "-C", str(root)] + list(a), timeout=10)
+            return stdout.rstrip() if code == 0 else ""
+
+        def capped(text, n=40):
+            lines = text.splitlines()
+            return "\n".join(lines[:n] + (["…(%d more)" % (len(lines) - n)] if len(lines) > n else []))
+
+        out += ["- Branch: `%s`" % (git("rev-parse", "--abbrev-ref", "HEAD") or "?"),
+                "- HEAD: `%s`" % (git("log", "-1", "--format=%h %s") or "no commits yet"), "",
+                "### Uncommitted changes", "~~~~", capped(git("status", "--short")) or "(clean)", "~~~~",
+                "### Diff stat vs HEAD", "~~~~", capped(git("diff", "--stat", "HEAD")) or "(none)", "~~~~",
+                "### Recent commits", "~~~~", git("log", "--oneline", "-5") or "(none)", "~~~~"]
+    else:
+        out.append("- Not a git repository.")
+    if last_message and last_message.strip():
+        out += ["", "### Last assistant message", fenced(last_message, 3000)]
+    out += ["", "### Resume pointers"]
+    if session_id and src == "claude":
+        out.append("- Back in Claude Code later: `claude --resume %s`" % session_id)
+    if transcript:
+        out.append("- Transcript: `%s`" % transcript)
+    out.append("- Shared memory: `memory_smart_search` / `memory_recall` for project `%s` (agentmemory)" % project)
+    out.append("- Code graph: codebase-memory-mcp (`search_graph`, `trace_path`, `get_architecture`)")
+    out.append(AUTO_END)
+    return "\n".join(out)
+
+
+def ensure_locally_ignored(root):
+    if not is_git(root):
+        return
+    code, _, _ = run(["git", "-C", str(root), "check-ignore", "-q", HANDOFF_FILE])
+    if code == 0:
+        return
+    code, out, _ = run(["git", "-C", str(root), "rev-parse", "--git-path", "info/exclude"])
+    if code != 0 or not out.strip():
+        return
+    exclude = Path(out.strip())
+    if not exclude.is_absolute():
+        exclude = Path(root) / exclude
+    try:
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        with open(exclude, "a", encoding="utf-8") as fh:
+            fh.write("\n# agent-stack handoff note (local only)\n/%s\n" % HANDOFF_FILE)
+    except OSError as exc:
+        log("could not update %s: %s" % (exclude, exc))
+
+
+def is_tracked(root, name):
+    code, _, _ = run(["git", "-C", str(root), "ls-files", "--error-unmatch", name])
+    return code == 0
+
+
+def narrative_of(text):
+    match = re.search(r"^## Narrative\s*$(.*?)(?=^## |\Z|%s)" % re.escape(AUTO_BEGIN), text, re.S | re.M)
+    return match.group(1).strip() if match else ""
+
+
+def post_agentmemory(cfg, project, src, summary):
+    """Best effort: store the handoff in agentmemory over REST. Payload fields are documented as
+    VERIFY in the playbook; failures are logged and ignored."""
+    if not cfg.get("agentmemory_remember", True):
+        return
+    url = str(cfg.get("agentmemory_url", "http://localhost:3111")).rstrip("/") + "/agentmemory/remember"
+    headers = {"Content-Type": "application/json"}
+    secret = HOME / ".agentmemory" / "secret"
+    try:
+        token = secret.read_text(encoding="utf-8").strip()
+        if token:
+            headers["Authorization"] = "Bearer " + token
+    except OSError:
+        pass
+    payload = {"content": summary, "type": "workflow", "project": project,
+               "title": "handoff: %s" % project, "agentId": src}
+    request = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers,
+                                     method="POST")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # never proxy localhost
+    try:
+        with opener.open(request, timeout=4) as resp:
+            log("agentmemory remember: HTTP %s" % resp.status)
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        log("agentmemory remember failed: %s" % exc)
+
+
+def write_handoff(cwd, src, reason, last_message="", transcript=None, session_id=None, cfg=None):
+    cfg = cfg or load_config()
+    root = git_root(cwd)
+    path = root / HANDOFF_FILE
+    project = project_name(root)
+    existing = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
+    if existing and is_git(root) and is_tracked(root, HANDOFF_FILE) and AUTO_BEGIN not in existing:
+        log("%s is tracked by git and not managed by agentstack; leaving it alone" % path)
+        return None
+    text = existing or handoff_template(project)
+    text = set_header(text, {"status": "open", "from": src, "updated": now_iso(),
+                             "reason": reason, "project": project})
+    block = auto_section(root, src, reason, last_message, transcript, session_id)
+    if AUTO_BEGIN in text and AUTO_END in text:
+        text = re.sub(re.escape(AUTO_BEGIN) + r".*?" + re.escape(AUTO_END), lambda _m: block, text, flags=re.S)
+    else:
+        text = text.rstrip() + "\n\n" + block + "\n"
+    write_text_atomic(path, text)
+    ensure_locally_ignored(root)
+    narrative = narrative_of(text)
+    summary = "Handoff from %s (%s) in project %s. Note: %s\n\n%s" % (
+        src, reason, project, path, narrative[:1500] or "(no narrative written yet)")
+    post_agentmemory(cfg, project, src, summary)
+    log("handoff written: %s (%s)" % (path, reason))
+    return path
+
+
+def cmd_handoff(args):
+    path = write_handoff(args.cwd or os.getcwd(), args.from_agent, args.reason)
+    if path:
+        print(path)
+        return 0
+    return 1
+
+
+# ---------------------------------------------------------------------------------------------
+# hooks
+
+
+def hook_prompt_guard(data, cfg):
+    request = read_json(STATE / "handoff-request.json")
+    if not request or request.get("agent") != "claude":
+        return 0
+    try:
+        created = dt.datetime.strptime(request.get("created", ""), "%Y-%m-%dT%H:%M:%SZ")
+        created = created.replace(tzinfo=dt.timezone.utc)
+        age_h = (dt.datetime.now(dt.timezone.utc) - created).total_seconds() / 3600
+    except ValueError:
+        age_h = 0
+    if age_h > float(cfg.get("request_max_age_hours", 6)):
+        return 0
+    session = data.get("session_id") or "unknown"
+    notified = request.get("notified_sessions") or []
+    if session in notified:
+        return 0
+    root = git_root(data.get("cwd") or request.get("repo_root") or os.getcwd())
+    emit_context("UserPromptSubmit", (
+        "agent-stack status (from the user's own hook): %s. Under the user's handoff protocol in "
+        "~/.agents/AGENTS.md a handoff is now due for this repo: a handoff memory (memory_save, type "
+        "workflow) and an updated Narrative section in %s." % (request.get("reason"), root / HANDOFF_FILE)))
+    request["notified_sessions"] = notified + [session]
+    write_json(STATE / "handoff-request.json", request)
+    return 0
+
+
+def hook_stop_failure(data, cfg):
+    error = str(data.get("error") or data.get("error_type") or "")
+    if error and error != "rate_limit":
+        return 0
+    cwd = data.get("cwd") or os.getcwd()
+    transcript = data.get("transcript_path")
+    message = last_assistant_text(transcript)
+    root = git_root(cwd)
+    write_handoff(root, "claude", "Claude usage limit reached", message, transcript, data.get("session_id"), cfg)
+    spawn_self(["switch", "--cwd", str(root), "--from", "claude", "--reason", "Claude usage limit reached",
+                "--no-handoff"])
+    return 0
+
+
+def hook_session_start(data, cfg, agent):
+    root = git_root(data.get("cwd") or os.getcwd())
+    path = root / HANDOFF_FILE
+    if not path.is_file():
+        return 0
+    text = path.read_text(encoding="utf-8", errors="replace")
+    meta = parse_header(text)
+    if meta.get("status", "open").lower() != "open":
+        return 0
+    age_h = (time.time() - path.stat().st_mtime) / 3600
+    if age_h > float(cfg.get("handoff_max_age_hours", 72)):
+        return 0
+    if meta.get("from") == agent and data.get("source") == "resume":
+        return 0  # resuming the same agent's own session: it already has this context
+    body = text if len(text) <= 6000 else text[:6000] + "\n…(truncated; read the full file)"
+    emit_context("SessionStart", "agent-stack: an open handoff note exists at %s (from %s, updated %.1f h ago).\n\n%s"
+                 % (path, meta.get("from", "unknown"), age_h, body))
+    return 0
+
+
+def cmd_hook(args):
+    data, _ = read_stdin_json()
+    cfg = load_config()
+    try:
+        if args.event == "prompt-guard":
+            return hook_prompt_guard(data, cfg)
+        if args.event == "stop-failure":
+            return hook_stop_failure(data, cfg)
+        if args.event == "session-start":
+            return hook_session_start(data, cfg, args.agent)
+    except Exception as exc:  # hooks fail open
+        log("hook %s error: %r" % (args.event, exc))
+    return 0
+
+
+# ---------------------------------------------------------------------------------------------
+# agent picker and launcher
+
+
+def available_choices(cfg):
+    def ok(choice):
+        if choice in ("codex", "agy", "hermes"):
+            return which(choice)
+        if choice == "claude-ollama":
+            return which("ollama") and which("claude")
+        if choice == "claude-omniroute":
+            return which("claude") and expand(cfg["omniroute_settings"]).is_file()
+        if choice == "codex-omniroute":
+            codex_home = expand(os.environ.get("CODEX_HOME") or "~/.codex")
+            return which("codex") and (codex_home / ("%s.config.toml" % cfg["codex_omniroute_profile"])).is_file()
+        return False
+    return [c for c in cfg.get("choices", []) if c in LABELS and ok(c)]
+
+
+def ui_pick(options, reason):
+    labels = [LABELS[o] for o in options] + [LABELS["keep"]]
+    prompt = "%s. Continue this work in:" % reason
+    selected = ""
+    if sys.platform == "darwin" and which("osascript"):
+        script = ("activate\nchoose from list {%s} with title \"agent-stack\" with prompt %s "
+                  "default items {%s} OK button name \"Switch\" cancel button name \"Not now\""
+                  % (", ".join(aq(l) for l in labels), aq(prompt), aq(labels[0])))
+        code, out, err = run(["osascript", "-e", script], timeout=900)
+        selected = out.strip() if code == 0 else ""
+        if code != 0:
+            log("osascript picker: %s" % err.strip())
+    elif which("zenity"):
+        code, out, _ = run(["zenity", "--list", "--title", "agent-stack", "--text", prompt,
+                            "--column", "Agent"] + labels, timeout=900)
+        selected = out.strip() if code == 0 else ""
+    elif which("kdialog"):
+        menu = []
+        for key in options + ["keep"]:
+            menu += [key, LABELS[key]]
+        code, out, _ = run(["kdialog", "--title", "agent-stack", "--menu", prompt] + menu, timeout=900)
+        return out.strip() if code == 0 and out.strip() in options else None
+    else:
+        notify("%s. Run `agentstack switch` in a terminal to pick an agent." % reason)
+        return None
+    for key in options:
+        if LABELS[key] == selected:
+            return key
+    return None
+
+
+def build_command(choice, root, cfg):
+    project = project_name(root)
+    prompt = cfg["resume_prompt"].format(project=project)
+    cont = bool(cfg.get("continue_same_session"))
+    if choice == "codex":
+        return ["codex", prompt]
+    if choice == "codex-omniroute":
+        return ["codex", "--profile", cfg["codex_omniroute_profile"], prompt]
+    if choice == "agy":
+        flag = cfg.get("agy_prompt_flag")
+        if flag:
+            return ["agy", flag, prompt]
+        if copy_to_clipboard(prompt):
+            notify("Resume prompt copied. Paste it into agy.")
+        return ["agy"]
+    if choice == "hermes":
+        return ["hermes", "chat", "-q", prompt]
+    if choice == "claude-ollama":
+        return ["ollama", "launch", "claude", "--model", cfg["ollama_model"], "--"] + (["--continue"] if cont else [prompt])
+    if choice == "claude-omniroute":
+        return ["claude", "--settings", str(expand(cfg["omniroute_settings"]))] + (["--continue"] if cont else [prompt])
+    raise ValueError("unknown choice %s" % choice)
+
+
+def terminal_argv(cfg, script):
+    term = cfg.get("terminal", "auto")
+    if sys.platform == "darwin":
+        if term.lower() in ("iterm", "iterm2"):
+            apple = ('tell application "iTerm"\ncreate window with default profile\n'
+                     'tell current session of current window to write text %s\nactivate\nend tell'
+                     % aq("bash " + shlex.quote(str(script))))
+        else:
+            apple = ('tell application "Terminal"\ndo script %s\nactivate\nend tell'
+                     % aq("bash " + shlex.quote(str(script))))
+        return ["osascript", "-e", apple]
+    candidates = [term] if term not in ("auto", "") else []
+    candidates += ["x-terminal-emulator", "gnome-terminal", "konsole", "kitty", "alacritty", "wezterm", "xterm"]
+    for name in candidates:
+        if not which(name):
+            continue
+        if name == "gnome-terminal":
+            return [name, "--", "bash", str(script)]
+        if name == "kitty":
+            return [name, "bash", str(script)]
+        if name == "wezterm":
+            return [name, "start", "--", "bash", str(script)]
+        return [name, "-e", "bash", str(script)]
+    return None
+
+
+def launch(choice, root, cfg):
+    argv = build_command(choice, root, cfg)
+    STATE.mkdir(parents=True, exist_ok=True)
+    script = STATE / ("launch-%s-%s.sh" % (choice, dt.datetime.now().strftime("%Y%m%d-%H%M%S")))
+    lines = ["#!/usr/bin/env bash", "cd %s || exit 1" % shlex.quote(str(root))]
+    for key, value in (cfg.get("launch_env") or {}).items():
+        lines.append("export %s=%s" % (key, shlex.quote(str(value))))
+    lines.append("printf '%%s\\n' %s" % shlex.quote("agent-stack: starting %s (handoff note: HANDOFF.md)" % LABELS[choice]))
+    lines.append("exec " + " ".join(shlex.quote(a) for a in argv))
+    script.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    script.chmod(0o700)
+    if os.environ.get("AGENTSTACK_DRY_RUN") == "1":
+        print("dry run, launcher written: %s" % script)
+        print(script.read_text(encoding="utf-8"))
+        return script
+    term = terminal_argv(cfg, script)
+    if not term:
+        notify("No terminal found. Run: bash %s" % script)
+        return script
+    subprocess.Popen(term, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+    log("launched %s via %s" % (choice, term[0]))
+    return script
+
+
+def cmd_switch(args):
+    cfg = load_config()
+    root = git_root(args.cwd or os.getcwd())
+    reason = args.reason or "Switching agents"
+    STATE.mkdir(parents=True, exist_ok=True)
+    lock = STATE / "switch.lock"
+    if lock.exists() and time.time() - lock.stat().st_mtime < 900 and not args.pick:
+        log("picker already open, skipping")
+        return 0
+    lock.write_text(str(os.getpid()), encoding="utf-8")
+    try:
+        options = available_choices(cfg)
+        pick = args.pick or os.environ.get("AGENTSTACK_PICK")
+        if not pick:
+            if not options:
+                notify("%s. No fallback agent is installed." % reason)
+                return 1
+            pick = ui_pick(options, reason)
+        if not pick or pick == "keep":
+            log("switch dismissed (%s)" % reason)
+            return 0
+        if pick not in LABELS:
+            print("unknown choice %s; options: %s" % (pick, ", ".join(options)), file=sys.stderr)
+            return 2
+        if not args.no_handoff:
+            write_handoff(root, args.from_agent, reason + "; switching to " + LABELS[pick], cfg=cfg)
+        launch(pick, root, cfg)
+        return 0
+    finally:
+        try:
+            lock.unlink()
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------------------------
+# sync rules and skills
+
+
+def upsert_block(path, body, dry):
+    path = Path(path)
+    old = path.read_text(encoding="utf-8") if path.is_file() else ""
+    block = "%s\n%s\n%s\n" % (BLOCK_BEGIN, body.rstrip(), BLOCK_END)
+    if BLOCK_BEGIN in old and BLOCK_END in old:
+        new = re.sub(re.escape(BLOCK_BEGIN) + r".*?" + re.escape(BLOCK_END) + r"\n?", lambda _m: block, old, flags=re.S)
+    else:
+        new = (old.rstrip() + "\n\n" if old.strip() else "") + block
+    if new == old:
+        return "ok"
+    if not dry:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        backup(path)
+        write_text_atomic(path, new)
+    return "updated" if old else "created"
+
+
+def ensure_import(path, line, dry):
+    path = Path(path)
+    old = path.read_text(encoding="utf-8") if path.is_file() else ""
+    if any(l.strip() == line for l in old.splitlines()):
+        return "ok"
+    if not dry:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        backup(path)
+        write_text_atomic(path, line + "\n\n" + old)
+    return "updated" if old else "created"
+
+
+def link_skill(src, dest, mode, dry):
+    if dest.is_symlink():
+        try:
+            if dest.resolve() == src.resolve():
+                return "ok"
+        except OSError:
+            pass
+        if not dest.exists():  # dangling link, ours or not: replace it
+            if not dry:
+                dest.unlink()
+        else:
+            return "conflict (links elsewhere)"
+    elif dest.exists():
+        return "conflict (exists)"
+    if not dry:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if mode == "copy":
+            shutil.copytree(str(src), str(dest))
+        else:
+            os.symlink(str(src), str(dest))
+    return "linked" if mode != "copy" else "copied"
+
+
+def cmd_sync(args):
+    cfg = load_config()
+    dry = args.check
+    report = []
+    codex_home = expand(os.environ.get("CODEX_HOME") or "~/.codex")
+    hermes_home = expand(os.environ.get("HERMES_HOME") or "~/.hermes")
+    claude_home = expand(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude")
+    has = {
+        "claude": claude_home.is_dir() or which("claude"),
+        "codex": codex_home.is_dir() or which("codex"),
+        "agy": (HOME / ".gemini").is_dir() or which("agy"),
+        "hermes": hermes_home.is_dir() or which("hermes"),
+    }
+    if not SHARED_RULES.is_file():
+        print("missing %s (install shared/AGENTS.md there first)" % SHARED_RULES, file=sys.stderr)
+        return 1
+    rules = SHARED_RULES.read_text(encoding="utf-8")
+    if has["claude"]:
+        report.append(("claude rules", claude_home / "CLAUDE.md",
+                       ensure_import(claude_home / "CLAUDE.md", "@~/.agents/AGENTS.md", dry)))
+    if has["codex"]:
+        override = codex_home / "AGENTS.override.md"
+        target = override if override.is_file() and override.read_text(encoding="utf-8").strip() else codex_home / "AGENTS.md"
+        report.append(("codex rules", target, upsert_block(target, rules, dry)))
+        if target.is_file() and target.stat().st_size > 32 * 1024:
+            report.append(("codex rules", target, "WARNING over 32 KiB; Codex truncates"))
+    if has["agy"]:
+        report.append(("agy rules", HOME / ".gemini" / "AGENTS.md", upsert_block(HOME / ".gemini" / "AGENTS.md", rules, dry)))
+    if has["hermes"]:
+        report.append(("hermes rules", hermes_home / "SOUL.md", upsert_block(hermes_home / "SOUL.md", rules, dry)))
+
+    targets = []
+    if has["claude"]:
+        targets.append(("claude skill", claude_home / "skills", set(cfg.get("claude_skip_skills") or []), "symlink"))
+    if has["agy"]:
+        targets.append(("agy skill", HOME / ".gemini" / "antigravity-cli" / "skills",
+                        set(cfg.get("agy_skip_skills") or []), cfg.get("agy_skills_mode", "symlink")))
+    skills = sorted(p for p in SHARED_SKILLS.iterdir() if (p / "SKILL.md").is_file()) if SHARED_SKILLS.is_dir() else []
+    for skill in skills:
+        for label, tdir, skip, mode in targets:
+            if skill.name in skip:
+                continue
+            report.append((label, tdir / skill.name, link_skill(skill, tdir / skill.name, mode, dry)))
+    for label, tdir, _skip, _mode in targets:  # drop links we made whose shared skill is gone
+        if tdir.is_dir():
+            for entry in tdir.iterdir():
+                if entry.is_symlink() and not entry.exists():
+                    try:
+                        target = os.readlink(str(entry))
+                    except OSError:
+                        continue
+                    if str(SHARED_SKILLS) in target:
+                        if not dry:
+                            entry.unlink()
+                        report.append((label, entry, "removed dangling link"))
+    if has["hermes"]:
+        cfg_text = (hermes_home / "config.yaml").read_text(encoding="utf-8") if (hermes_home / "config.yaml").is_file() else ""
+        ok = "external_dirs" in cfg_text and ".agents/skills" in cfg_text
+        report.append(("hermes skills", hermes_home / "config.yaml",
+                       "ok" if ok else "ACTION: add ~/.agents/skills to skills.external_dirs"))
+    for label, path, result in report:
+        print("%-14s %-26s %s" % (label, result, path))
+    return 0
+
+
+# ---------------------------------------------------------------------------------------------
+# install / uninstall hooks
+
+
+def is_ours(group):
+    return any("agentstack" in str(h.get("command", "")) for h in group.get("hooks", []) if isinstance(h, dict))
+
+
+def load_json_file(path):
+    if not path.is_file():
+        return {}
+    text = path.read_text(encoding="utf-8")
+    if not text.strip():
+        return {}
+    data = json.loads(text)  # let a parse error abort instead of clobbering the file
+    if not isinstance(data, dict):
+        raise ValueError("%s is not a JSON object" % path)
+    return data
+
+
+def merge_hooks(data, desired, remove_only=False):
+    hooks = data.setdefault("hooks", {})
+    for event in set(list(desired.keys()) + list(hooks.keys())):
+        groups = hooks.get(event)
+        if not isinstance(groups, list):
+            continue
+        hooks[event] = [g for g in groups if not (isinstance(g, dict) and is_ours(g))]
+    if not remove_only:
+        for event, groups in desired.items():
+            hooks.setdefault(event, []).extend(groups)
+    for event in list(hooks.keys()):
+        if hooks[event] == []:
+            del hooks[event]
+    if not hooks:
+        del data["hooks"]
+    return data
+
+
+def install_statusline(data, agent, cfg_cmd, remove=False):
+    cfg = load_config()
+    chain = dict(cfg.get("statusline_chain") or {})
+    current = data.get("statusLine") if isinstance(data.get("statusLine"), dict) else None
+    current_cmd = str((current or {}).get("command", ""))
+    if remove:
+        if "agentstack" in current_cmd:
+            if chain.get(agent):
+                data["statusLine"] = {"type": "command", "command": chain[agent]}
+            else:
+                data.pop("statusLine", None)
+            chain.pop(agent, None)
+            save_config_key("statusline_chain", chain)
+        return data
+    if current_cmd and "agentstack" not in current_cmd:
+        chain[agent] = current_cmd
+        save_config_key("statusline_chain", chain)
+    data["statusLine"] = {"type": "command", "command": cfg_cmd, "padding": 0}
+    return data
+
+
+def cmd_install(args, remove=False):
+    me = shlex.quote(str(SELF))
+    dry = args.dry_run
+    if args.agent == "claude":
+        path = expand(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude") / "settings.json"
+        desired = {
+            "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "%s hook prompt-guard" % me, "timeout": 10}]}],
+            "StopFailure": [{"matcher": "rate_limit", "hooks": [{"type": "command", "command": "%s hook stop-failure" % me, "timeout": 30}]}],
+            "SessionStart": [{"matcher": "startup|resume|clear|compact", "hooks": [{"type": "command", "command": "%s hook session-start --agent claude" % me, "timeout": 10}]}],
+        }
+        status_cmd = "%s statusline --agent claude" % me
+    elif args.agent == "codex":
+        path = expand(os.environ.get("CODEX_HOME") or "~/.codex") / "hooks.json"
+        desired = {"SessionStart": [{"matcher": "startup|resume|clear|compact", "hooks": [{"type": "command", "command": "%s hook session-start --agent codex" % me, "timeout": 10}]}]}
+        status_cmd = None
+    elif args.agent == "agy":
+        path = HOME / ".gemini" / "antigravity-cli" / "settings.json"
+        desired = {}
+        status_cmd = "%s statusline --agent agy" % me
+    else:
+        print("unknown agent %s" % args.agent, file=sys.stderr)
+        return 2
+    try:
+        data = load_json_file(path)
+    except ValueError as exc:
+        print("refusing to edit %s: %s" % (path, exc), file=sys.stderr)
+        return 1
+    before = json.dumps(data, sort_keys=True)
+    if args.agent != "agy":  # agy keeps hooks in its own format; agentstack only adds a status line there
+        merge_hooks(data, desired, remove_only=remove)
+    if status_cmd:
+        if dry:
+            # do not touch the saved chain on a dry run
+            preview = dict(data)
+            preview["statusLine"] = {"type": "command", "command": status_cmd, "padding": 0}
+            if remove:
+                preview.pop("statusLine", None)
+            data = preview
+        else:
+            install_statusline(data, args.agent, status_cmd, remove=remove)
+    after = json.dumps(data, sort_keys=True)
+    if before == after:
+        print("%s: already %s" % (path, "clean" if remove else "installed"))
+        return 0
+    if dry:
+        print("would write %s:\n%s" % (path, json.dumps(data, indent=2)))
+        return 0
+    path.parent.mkdir(parents=True, exist_ok=True)
+    saved = backup(path)
+    write_json(path, data)
+    print("%s %s%s" % ("cleaned" if remove else "updated", path, " (backup %s)" % saved if saved else ""))
+    if args.agent == "codex" and not remove:
+        print("Codex: open /hooks in Codex and trust the agentstack SessionStart hook.")
+    return 0
+
+
+# ---------------------------------------------------------------------------------------------
+# doctor
+
+
+def http_status(url, method="GET", headers=None, body=None, timeout=2.5):
+    request = urllib.request.Request(url, data=body, headers=headers or {}, method=method)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(request, timeout=timeout) as resp:
+            return resp.status
+    except urllib.error.HTTPError as exc:
+        return exc.code
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+
+
+def tcp_open(host, port, timeout=0.7):
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def lan_ip():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("10.255.255.255", 1))
+        ip = sock.getsockname()[0]
+        return None if ip.startswith("127.") else ip
+    except OSError:
+        return None
+    finally:
+        sock.close()
+
+
+SUSPECT_HOOKS = [
+    ("hindsight", "Hindsight hooks (second episodic layer)"),
+    ("hook-handler.cjs", "ruflo hooks"),
+    ("auto-memory-hook", "ruflo memory hooks"),
+    ("claude-flow", "ruflo hooks"),
+    ("ruflo", "ruflo hooks"),
+    ("hook-guard", "graphify PreToolUse nudges"),
+    ("obsidian-mind", "obsidian-mind capture hooks"),
+]
+
+
+def hook_commands(data):
+    found = []
+    hooks = data.get("hooks") if isinstance(data, dict) else None
+    if isinstance(hooks, dict):
+        for event, groups in hooks.items():
+            for group in groups if isinstance(groups, list) else []:
+                for hook in (group.get("hooks") or []) if isinstance(group, dict) else []:
+                    if isinstance(hook, dict):
+                        found.append((event, str(hook.get("command", ""))))
+    return found
+
+
+def yaml_block_keys(text, top):
+    """Names directly under a top-level YAML key (indentation heuristic, no YAML library)."""
+    keys, inside, indent = [], False, None
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if not line.startswith((" ", "\t")):
+            inside = line.split(":", 1)[0].strip() == top
+            indent = None
+            continue
+        if inside:
+            width = len(line) - len(line.lstrip())
+            if indent is None:
+                indent = width
+            if width == indent and ":" in line:
+                keys.append(line.strip().split(":", 1)[0].strip().strip('"\''))
+    return keys
+
+
+def cmd_doctor(_args):
+    rows = []
+
+    def add(level, area, message):
+        rows.append((level, area, message))
+
+    for name in ["claude", "codex", "agy", "hermes", "ollama", "omniroute", "agentmemory",
+                 "codebase-memory-mcp", "graphify", "git", "node", "npx", "python3", "docker"]:
+        path = shutil.which(name)
+        add("PASS" if path else "INFO", "command", "%s %s" % (name, path or "not found"))
+    copies = []
+    for folder in os.environ.get("PATH", "").split(os.pathsep):
+        candidate = Path(folder) / "codebase-memory-mcp"
+        if candidate.is_file() and os.access(str(candidate), os.X_OK):
+            real = str(candidate.resolve())
+            if real not in copies:
+                copies.append(real)
+    if len(copies) > 1:
+        add("WARN", "codebase-memory-mcp", "several binaries on PATH (mixed builds are refused): %s" % ", ".join(copies))
+
+    cfg = load_config()
+    am = str(cfg.get("agentmemory_url", "http://localhost:3111")).rstrip("/")
+    services = [
+        ("agentmemory", am + "/agentmemory/livez", True),
+        ("ollama", "http://127.0.0.1:11434/api/tags", False),
+        ("omniroute", "http://127.0.0.1:20128/v1/models", False),
+    ]
+    for name, url, important in services:
+        status = http_status(url)
+        if status is None:
+            add("FAIL" if important else "INFO", name, "not reachable at %s" % url)
+        else:
+            add("PASS", name, "HTTP %s at %s" % (status, url))
+    if tcp_open("127.0.0.1", 20128):
+        probe = json.dumps({"model": "agentstack-doctor-probe", "messages": [{"role": "user", "content": "x"}],
+                            "max_tokens": 1}).encode()
+        status = http_status("http://127.0.0.1:20128/v1/chat/completions", "POST",
+                             {"Content-Type": "application/json"}, probe)
+        if status in (401, 403):
+            add("PASS", "omniroute", "inference requires an API key")
+        else:
+            add("FAIL", "omniroute", "unauthenticated inference request got HTTP %s; set REQUIRE_API_KEY=true" % status)
+    ip = lan_ip()
+    for name, port in [("omniroute", 20128), ("agentmemory", 3111), ("hindsight", 8888), ("ollama", 11434),
+                       ("graphify-mcp", 8080), ("obsidian-rest", 27124)]:
+        if ip and tcp_open(ip, port):
+            add("FAIL" if name in ("omniroute", "agentmemory", "hindsight") else "WARN", name,
+                "port %d is reachable on the LAN address %s; bind it to 127.0.0.1" % (port, ip))
+    if not (HOME / ".agentmemory" / "secret").is_file():
+        add("WARN", "agentmemory", "~/.agentmemory/secret missing (daemon never started, or pre-0.9.30)")
+
+    claude_home = expand(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude")
+    seen = set()
+    for settings in [claude_home / "settings.json", Path.cwd() / ".claude" / "settings.json",
+                     Path.cwd() / ".claude" / "settings.local.json"]:
+        key = str(settings.resolve()) if settings.exists() else str(settings)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            data = load_json_file(settings)
+        except ValueError as exc:
+            add("FAIL", "claude", "%s does not parse: %s" % (settings, exc))
+            continue
+        if not data:
+            continue
+        for event, command in hook_commands(data):
+            for needle, what in SUSPECT_HOOKS:
+                if needle in command:
+                    add("WARN", "claude hooks", "%s in %s (%s): %s" % (what, settings, event, command[:120]))
+        if settings.parent == claude_home:
+            status_cmd = str((data.get("statusLine") or {}).get("command", ""))
+            add("PASS" if "agentstack" in status_cmd else "WARN", "claude", "status line: %s" % (status_cmd or "none"))
+            events = [e for e, c in hook_commands(data) if "agentstack" in c]
+            add("PASS" if "StopFailure" in events else "WARN", "claude", "agentstack hooks: %s" % (", ".join(sorted(set(events))) or "none"))
+            plugins = data.get("enabledPlugins") or {}
+            names = [k for k, v in plugins.items() if v] if isinstance(plugins, dict) else []
+            add("INFO", "claude plugins", ", ".join(sorted(names)) or "none")
+            if any(n.startswith("hindsight") for n in names):
+                add("WARN", "claude plugins", "legacy Hindsight plugin is enabled (duplicate capture)")
+            if any(n.startswith("ruflo") for n in names):
+                add("WARN", "claude plugins", "ruflo plugins are enabled (hooks, ranked-memory injection)")
+            if data.get("autoContinueAtUsageLimit", True) is not False:
+                add("INFO", "claude", "autoContinueAtUsageLimit is on: the old session resumes by itself after the reset")
+        elif "statusLine" in data:
+            add("WARN", "claude", "project status line in %s overrides the agentstack one" % settings)
+    claude_json = read_json(HOME / ".claude.json") or {}
+    servers = sorted((claude_json.get("mcpServers") or {}).keys())
+    add("INFO", "claude mcp (user)", ", ".join(servers) or "none")
+    if "agentmemory" in servers and any(k.startswith("agentmemory@") for k in ((read_json(claude_home / "settings.json") or {}).get("enabledPlugins") or {})):
+        add("WARN", "claude mcp", "agentmemory is registered twice (plugin and ~/.claude.json)")
+    claude_md = claude_home / "CLAUDE.md"
+    if claude_md.is_file():
+        text = claude_md.read_text(encoding="utf-8", errors="replace")
+        add("PASS" if "@~/.agents/AGENTS.md" in text else "WARN", "claude rules", "import of ~/.agents/AGENTS.md %s" % ("present" if "@~/.agents/AGENTS.md" in text else "missing"))
+        if "Ruflo Integration" in text:
+            add("WARN", "claude rules", "'# Ruflo Integration' block still in %s" % claude_md)
+
+    codex_home = expand(os.environ.get("CODEX_HOME") or "~/.codex")
+    toml_path = codex_home / "config.toml"
+    if toml_path.is_file():
+        text = toml_path.read_text(encoding="utf-8", errors="replace")
+        servers = re.findall(r"^\[mcp_servers\.([^\].]+)\]", text, re.M)
+        add("INFO", "codex mcp", ", ".join(servers) or "none")
+        for needle in ("hindsight", "ruflo", "claude-flow"):
+            if needle in servers:
+                add("WARN", "codex mcp", "%s is registered in %s" % (needle, toml_path))
+    try:
+        codex_hooks = load_json_file(codex_home / "hooks.json")
+    except ValueError as exc:
+        codex_hooks = {}
+        add("FAIL", "codex", "hooks.json does not parse: %s" % exc)
+    for event, command in hook_commands(codex_hooks):
+        for needle, what in SUSPECT_HOOKS:
+            if needle in command:
+                add("WARN", "codex hooks", "%s (%s): %s" % (what, event, command[:120]))
+    if codex_hooks:
+        add("PASS" if any("agentstack" in c for _, c in hook_commands(codex_hooks)) else "WARN", "codex", "agentstack SessionStart hook")
+
+    gemini = HOME / ".gemini" / "config"
+    mcp = read_json(gemini / "mcp_config.json")
+    if mcp is not None:
+        names = sorted((mcp.get("mcpServers") or {}).keys())
+        add("INFO", "agy mcp", ", ".join(names) or "none")
+    elif (gemini / "mcp_config.json").is_file():
+        add("INFO", "agy mcp", "mcp_config.json has comments or does not parse; check by hand")
+    agy_hooks = read_json(gemini / "hooks.json")
+    if agy_hooks and "hindsight" in json.dumps(agy_hooks):
+        add("WARN", "agy hooks", "Hindsight hooks present in %s" % (gemini / "hooks.json"))
+
+    hermes_home = expand(os.environ.get("HERMES_HOME") or "~/.hermes")
+    yaml_path = hermes_home / "config.yaml"
+    if yaml_path.is_file():
+        text = yaml_path.read_text(encoding="utf-8", errors="replace")
+        add("INFO", "hermes mcp", ", ".join(yaml_block_keys(text, "mcp_servers")) or "none")
+        match = re.search(r"^memory:\s*\n((?:[ \t]+.*\n?)*)", text, re.M)
+        provider = None
+        if match:
+            pm = re.search(r"^\s+provider:\s*['\"]?([\w-]+)", match.group(1), re.M)
+            provider = pm.group(1) if pm else None
+        add("PASS" if provider == "agentmemory" else "WARN", "hermes", "memory.provider = %s" % (provider or "none"))
+        add("PASS" if ".agents/skills" in text else "WARN", "hermes", "skills.external_dirs includes ~/.agents/skills: %s" % (".agents/skills" in text))
+
+    add("PASS" if SHARED_RULES.is_file() else "FAIL", "rules", "%s %s" % (SHARED_RULES, "present" if SHARED_RULES.is_file() else "missing"))
+    if SHARED_RULES.is_file():
+        body = SHARED_RULES.read_text(encoding="utf-8")
+        for label, path in [("codex", codex_home / "AGENTS.md"), ("agy", HOME / ".gemini" / "AGENTS.md"),
+                            ("hermes", hermes_home / "SOUL.md")]:
+            if path.is_file():
+                text = path.read_text(encoding="utf-8", errors="replace")
+                current = BLOCK_BEGIN in text and body.rstrip() in text
+                add("PASS" if current else "WARN", "rules", "%s copy in %s is %s" % (label, path, "current" if current else "missing or stale (run agentstack sync)"))
+        if re.search(r"<!--[^>]*(ignore|override|system|secret|hidden)", body, re.I):
+            add("FAIL", "rules", "an HTML comment in AGENTS.md contains a word Hermes blocks")
+
+    worst = 0
+    for level, area, message in rows:
+        print("%-5s %-20s %s" % (level, area, message))
+        worst = max(worst, {"PASS": 0, "INFO": 0, "WARN": 1, "FAIL": 2}[level])
+    return 1 if worst == 2 else 0
+
+
+# ---------------------------------------------------------------------------------------------
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="agentstack", description=__doc__.split("\n\n")[0])
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("statusline")
+    p.add_argument("--agent", choices=["claude", "agy"], default="claude")
+    p = sub.add_parser("hook")
+    p.add_argument("event", choices=["prompt-guard", "stop-failure", "session-start"])
+    p.add_argument("--agent", default="claude")
+    p = sub.add_parser("handoff")
+    p.add_argument("--cwd")
+    p.add_argument("--from", dest="from_agent", default="manual")
+    p.add_argument("--reason", default="manual handoff")
+    p = sub.add_parser("switch")
+    p.add_argument("--cwd")
+    p.add_argument("--from", dest="from_agent", default="claude")
+    p.add_argument("--reason")
+    p.add_argument("--pick", choices=sorted(LABELS))
+    p.add_argument("--no-handoff", action="store_true", help="the caller already refreshed HANDOFF.md")
+    p = sub.add_parser("sync")
+    p.add_argument("--check", action="store_true", help="report only, change nothing")
+    for name in ("install", "uninstall"):
+        p = sub.add_parser(name)
+        p.add_argument("--agent", required=True, choices=["claude", "codex", "agy"])
+        p.add_argument("--dry-run", action="store_true")
+    sub.add_parser("doctor")
+    args = parser.parse_args(argv)
+    if args.cmd == "statusline":
+        return cmd_statusline(args)
+    if args.cmd == "hook":
+        return cmd_hook(args)
+    if args.cmd == "handoff":
+        return cmd_handoff(args)
+    if args.cmd == "switch":
+        return cmd_switch(args)
+    if args.cmd == "sync":
+        return cmd_sync(args)
+    if args.cmd == "install":
+        return cmd_install(args)
+    if args.cmd == "uninstall":
+        return cmd_install(args, remove=True)
+    if args.cmd == "doctor":
+        return cmd_doctor(args)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

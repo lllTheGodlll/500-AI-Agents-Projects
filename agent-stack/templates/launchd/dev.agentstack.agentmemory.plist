@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- agent-stack: runs the agentmemory daemon at login with a clean environment, so provider keys
+     exported in your shell (OPENAI_API_KEY, ANTHROPIC_API_KEY, ...) never reach it.
+     Replace __AGENTMEMORY_BIN__, __NODE_DIR__ and __HOME__, then:
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.agentstack.agentmemory.plist -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.agentstack.agentmemory</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__AGENTMEMORY_BIN__</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__NODE_DIR__:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key>
+    <string>__HOME__</string>
+    <key>CI</key>
+    <string>1</string>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>__HOME__/.agentmemory</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>__HOME__/.agents/stack/logs/agentmemory.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.agents/stack/logs/agentmemory.err.log</string>
+</dict>
+</plist>

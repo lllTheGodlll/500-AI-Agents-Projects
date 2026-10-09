@@ -1,0 +1,26 @@
+# ~/.agentmemory/.env written by agent-stack (agentmemory 0.9.30). The daemon reads this file.
+# Merge it with the file that onboarding created; keep any keys that are already there.
+
+# Embeddings run on this machine. The choice is fixed once memories exist: switching later
+# needs AGENTMEMORY_DROP_STALE_INDEX=true and a rebuild.
+EMBEDDING_PROVIDER=local
+
+# Only the 8 core MCP tools (save, recall, smart_search, sessions, consolidate, diagnose,
+# lesson_save, reflect) instead of 54. Codex, agy, Hermes and local models load every schema.
+AGENTMEMORY_TOOLS=core
+AGENTMEMORY_AGENT_SCOPE=shared
+AGENTMEMORY_AUTO_COMPRESS=false
+
+# LLM for session summaries and consolidation. Default: local Ollama, so no subscription quota.
+OPENAI_API_KEY=ollama
+OPENAI_BASE_URL=http://localhost:11434/v1
+OPENAI_MODEL=__MEMORY_MODEL__
+AGENTMEMORY_LLM_NOTHINK=1
+
+# Alternative: OmniRoute with the memory-services key (route it to API-key or local models only).
+# OPENAI_API_KEY=__OMNIROUTE_MEMORY_KEY__
+# OPENAI_BASE_URL=http://127.0.0.1:20128/v1
+# OPENAI_MODEL=__OMNIROUTE_MEMORY_MODEL__
+
+# Obsidian exports (memory_obsidian_export) may only write under this folder.
+AGENTMEMORY_EXPORT_ROOT=__VAULT__

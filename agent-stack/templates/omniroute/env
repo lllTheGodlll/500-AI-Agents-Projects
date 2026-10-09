@@ -1,0 +1,10 @@
+# agent-stack hardening for ~/.omniroute/.env (OmniRoute 3.8.x). Merge, then restart OmniRoute.
+# npm installs listen on 0.0.0.0 without an API key by default: anyone on your network could
+# spend every connected account.
+HOST=127.0.0.1
+OMNIROUTE_SERVER_HOST=127.0.0.1
+REQUIRE_API_KEY=true
+# Skip an account before it returns 429 (raise the cutoff to 10-15% in Settings > Quota Preflight Cutoff).
+QUOTA_PREFLIGHT_CUTOFF_ENABLED=true
+# The memory layer (agentmemory + HANDOFF.md) owns handoffs; stop OmniRoute's own summaries.
+UNIVERSAL_CONTEXT_HANDOFF_ENABLED=false

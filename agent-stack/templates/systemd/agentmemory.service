@@ -1,0 +1,19 @@
+# agent-stack: agentmemory daemon as a systemd user service (Linux).
+# Replace __AGENTMEMORY_BIN__ and __NODE_DIR__, copy to ~/.config/systemd/user/agentmemory.service, then:
+#   systemctl --user daemon-reload && systemctl --user enable --now agentmemory
+[Unit]
+Description=agentmemory daemon (agent-stack)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.agentmemory
+Environment=CI=1
+Environment=PATH=__NODE_DIR__:/usr/local/bin:/usr/bin:/bin
+ExecStart=__AGENTMEMORY_BIN__
+ExecStop=__AGENTMEMORY_BIN__ stop
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
