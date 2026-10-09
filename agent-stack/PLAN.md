@@ -90,7 +90,8 @@ different project.
    archives the finished note to `~/.agents/stack/state/handoff-archive/`.
 
 `HANDOFF.md` is added to `.git/info/exclude`, so it never shows up in commits. agentstack never
-writes, reads or injects a `HANDOFF.md` that git tracks, or one it did not write. A cloned repo
+writes, reads or injects a `HANDOFF.md` that git tracks, or one it did not write on this machine (it keeps a registry of
+the notes it wrote). A cloned repo
 that ships its own `HANDOFF.md` cannot slip instructions into your agents this way. Even its own
 notes are injected as data ("check this against git"), without the quoted last message.
 
@@ -155,8 +156,8 @@ These are the parts that can cost you an account. Quotes are from the providers'
 - **Hindsight.** A non-interactive install (for example one run by Claude Code) defaults to
   Hindsight Cloud and uploads transcripts. Its MCP endpoint has no auth by default.
 - **agentmemory** sends memory text to whatever LLM key it finds in its environment. If you start
-  it from a shell that exports `OPENAI_API_KEY`, your memories go to OpenAI. The launchd service
-  here starts it with a clean environment.
+  it from a shell that exports `OPENAI_API_KEY`, your memories go to OpenAI. The launchd and systemd
+  services here start it with an empty environment (`env -i`) plus the few variables it needs.
 - **Memory is untrusted data.** Anything an earlier session saved can contain prompt injection,
   including a web page an agent fetched (hooks record tool output). Memory also arrives without
   being asked for: before compaction in Claude and Codex, and on every model call in Hermes. The
@@ -181,7 +182,7 @@ These are the parts that can cost you an account. Quotes are from the providers'
 | 8 | agentmemory auto-injection | at session start: off (the handoff note and the "search first" rule cover it). Before compaction (Claude, Codex, up to 1500 tokens): on, can be set to 0. Hermes provider: always on while it is the provider |
 | 9 | claude-obsidian `hot.md` injection in Claude | off (avoids a third injected block) |
 | 10 | Which repos to index now | the repos you are working on |
-| 11 | Claude's own auto memory (`~/.claude/projects/<p>/memory/`) | keep as a Claude-only cache; the shared rules say durable facts also go to agentmemory |
+| – | Claude's own auto memory (`~/.claude/projects/<p>/memory/`) | not asked: stays on as a Claude-only cache; the shared rules say durable facts also go to agentmemory |
 
 ## Built-in memories of each agent
 
@@ -219,7 +220,7 @@ never loses them.
 |---|---|
 | `SETUP-PLAYBOOK.md` | Step-by-step setup for an agent to execute (Claude Code recommended) |
 | `bin/agentstack` | The glue: status line, hooks, handoff file, owner guard and `reclaim`, picker and launcher, rules/skills sync, install/uninstall, doctor |
-| `tests/test_agentstack.py` | 40 tests on a throwaway HOME (pass on Python 3.9 and 3.13) |
+| `tests/test_agentstack.py` | 49 tests on a throwaway HOME (pass on Python 3.9 and 3.13) |
 | `shared/AGENTS.md` | The shared rules every agent gets (`__VAULT__` is filled in at setup) |
 | `shared/skills/agent-handoff/SKILL.md` | Cross-agent skill: write or pick up a handoff |
 | `templates/` | agentmemory `.env`, launchd/systemd service, OmniRoute hardening, Claude/Codex/Hermes fallback profiles |

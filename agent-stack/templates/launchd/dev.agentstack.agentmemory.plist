@@ -9,22 +9,18 @@
 <dict>
   <key>Label</key>
   <string>dev.agentstack.agentmemory</string>
+  <!-- env -i: the daemon gets only these variables, not whatever `launchctl setenv` put into the
+       login session. If the store is not in the default place, add AGENTMEMORY_DATA_DIR=/path
+       as one more string before __AGENTMEMORY_BIN__. -->
   <key>ProgramArguments</key>
   <array>
+    <string>/usr/bin/env</string>
+    <string>-i</string>
+    <string>HOME=__HOME__</string>
+    <string>PATH=__NODE_DIR__:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <string>CI=1</string>
     <string>__AGENTMEMORY_BIN__</string>
   </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>PATH</key>
-    <string>__NODE_DIR__:/usr/bin:/bin:/usr/sbin:/sbin</string>
-    <key>HOME</key>
-    <string>__HOME__</string>
-    <key>CI</key>
-    <string>1</string>
-    <!-- If the existing store is not in the default place, add:
-    <key>AGENTMEMORY_DATA_DIR</key>
-    <string>/path/to/the/store</string> -->
-  </dict>
   <key>WorkingDirectory</key>
   <string>__HOME__/.agentmemory</string>
   <key>RunAtLoad</key>

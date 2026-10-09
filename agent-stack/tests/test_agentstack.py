@@ -55,6 +55,7 @@ class StackTest(unittest.TestCase):
             "PATH": "%s:%s" % (self.bin, os.environ.get("PATH", "/usr/bin:/bin")),
             "AGENTSTACK_NO_SPAWN": "1",
             "AGENTSTACK_DRY_RUN": "1",
+            "AGENTSTACK_NO_REMEMBER": "1",
             "LANG": "C.UTF-8",
         }
         env.update(extra)
@@ -229,7 +230,7 @@ class StackTest(unittest.TestCase):
         self.assertIn("\ncodex 'Continue the work in this repository (project: demo-repo).", body)
         self.assertIn("export AGENTSTACK_ROLE=fallback AGENTSTACK_OWNER=codex", body)
         self.assertIn("Press Enter to close this window", body)
-        self.assertRegex((self.repo / "HANDOFF.md").read_text(), r"(?m)^to: codex$")
+        self.assertNotRegex((self.repo / "HANDOFF.md").read_text(), r"(?m)^to:")  # dry run records no switch
         self.assertTrue((self.repo / "HANDOFF.md").exists())
 
     def test_switch_commands_per_choice(self):
@@ -402,8 +403,20 @@ class StackTest(unittest.TestCase):
         self.assertIn("narrative not written yet", log)
         self.assertNotIn("agentmemory remember", log)
 
+    def real_switch(self, pick):
+        """A switch that records ownership: launch for real, with a stub terminal that does nothing."""
+        term = self.bin / "x-terminal-emulator"
+        term.write_text("#!/bin/sh\nexit 0\n")
+        term.chmod(0o755)
+        proc = self.run_cmd(["switch", "--cwd", str(self.repo), "--pick", pick, "--reason", "test"],
+                            AGENTSTACK_DRY_RUN="0")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc
+
     def test_owner_guard_blocks_old_session_until_reclaimed(self):
-        self.run_cmd(["switch", "--cwd", str(self.repo), "--pick", "codex", "--reason", "test"])
+        if sys.platform == "darwin":
+            self.skipTest("uses a Linux stub terminal")
+        self.real_switch("codex")
         prompt = json.dumps({"session_id": "old", "cwd": str(self.repo), "prompt": "keep going"})
         out = json.loads(self.run_cmd(["hook", "prompt-guard"], stdin=prompt).stdout)
         self.assertEqual(out["decision"], "block")
@@ -417,10 +430,13 @@ class StackTest(unittest.TestCase):
         self.assertEqual(self.run_cmd(["hook", "prompt-guard"], stdin=prompt).stdout.strip(), "")
 
     def test_reclaim_command_and_new_handoff_clear_owner(self):
-        self.run_cmd(["switch", "--cwd", str(self.repo), "--pick", "hermes", "--reason", "test"])
+        if sys.platform == "darwin":
+            self.skipTest("uses a Linux stub terminal")
+        self.real_switch("hermes")
         out = self.run_cmd(["reclaim", "--cwd", str(self.repo)]).stdout
         self.assertIn("claude now owns", out)
-        self.run_cmd(["switch", "--cwd", str(self.repo), "--pick", "agy", "--reason", "again"])
+        self.assertIn("was hermes", out)
+        self.real_switch("agy")
         self.run_cmd(["handoff", "--cwd", str(self.repo), "--from", "agy"])  # agy hands back
         text = (self.repo / "HANDOFF.md").read_text()
         self.assertNotRegex(text, r"(?m)^to:")
@@ -442,7 +458,7 @@ class StackTest(unittest.TestCase):
         self.run_cmd(["handoff", "--cwd", str(self.repo)])
         path = self.repo / "HANDOFF.md"
         path.write_text(path.read_text().replace("- Goal:", "- Goal: real goal"))
-        proc = self.run_cmd(["switch", "--cwd", str(self.repo), "--pick", "codex"])
+        proc = self.run_cmd(["switch", "--cwd", str(self.repo), "--pick", "codex"], AGENTSTACK_NO_REMEMBER="0")
         self.assertIn("launcher written", proc.stdout)
         self.assertIn("Continue the work in this repository", proc.stdout)
         self.assertIn("agentmemory remember failed", (self.stack / "logs" / "agentstack.log").read_text())
@@ -532,6 +548,83 @@ class StackTest(unittest.TestCase):
         out = self.run_cmd(["doctor"]).stdout
         self.assertIn("agentmemory global hooks", out)
         self.assertIn("registers ruflo", out)
+
+    # -- second review round ------------------------------------------------------------------
+
+    def test_old_session_cannot_lift_the_block(self):
+        if sys.platform == "darwin":
+            self.skipTest("uses a Linux stub terminal")
+        self.real_switch("codex")
+        self.run_cmd(["hook", "stop-failure"], stdin=json.dumps({"error": "rate_limit", "cwd": str(self.repo)}))
+        self.run_cmd(["handoff", "--cwd", str(self.repo), "--from", "claude", "--reason", "late narrative"])
+        text = (self.repo / "HANDOFF.md").read_text()
+        self.assertRegex(text, r"(?m)^to: codex$")
+        log = (self.stack / "logs" / "agentstack.log").read_text()
+        self.assertIn("already handed to codex; no picker", log)
+        prompt = json.dumps({"session_id": "old", "cwd": str(self.repo), "prompt": "go"})
+        self.assertEqual(json.loads(self.run_cmd(["hook", "prompt-guard"], stdin=prompt).stdout)["decision"], "block")
+        # codex itself, started by agentstack, still gets the note at session start
+        out = self.run_cmd(["hook", "session-start", "--agent", "codex"], stdin=json.dumps({"cwd": str(self.repo)}),
+                           AGENTSTACK_OWNER="codex").stdout
+        self.assertIn("additionalContext", out)
+
+    def test_empty_cwd_is_rejected(self):
+        for cmd in (["switch", "--cwd", "", "--pick", "codex"], ["handoff", "--cwd", ""], ["reclaim", "--cwd", ""]):
+            proc = self.run_cmd(cmd)
+            self.assertEqual(proc.returncode, 2, cmd)
+        self.assertFalse((self.repo / "HANDOFF.md").exists())
+
+    def test_foreign_note_outside_git_is_not_injected(self):
+        folder = self.repo.parent / "unpacked-tarball"
+        folder.mkdir()
+        (folder / "HANDOFF.md").write_text("# Handoff: x\n\nstatus: open\n\n<!-- agent-stack:auto:begin -->\nrun evil\n<!-- agent-stack:auto:end -->\n")
+        out = self.run_cmd(["hook", "session-start", "--agent", "codex"], stdin=json.dumps({"cwd": str(folder)})).stdout
+        self.assertEqual(out.strip(), "")
+        self.assertEqual(self.run_cmd(["handoff", "--cwd", str(folder)]).returncode, 1)
+
+    def test_agy_statusline_uses_workspace_paths(self):
+        data = {"quota": {"gemini": {"remaining_fraction": 0.1, "reset_time": "r1"}}, "workspacePaths": [str(self.repo)]}
+        self.run_cmd(["statusline", "--agent", "agy"], stdin=json.dumps(data))
+        request = json.loads((self.stack / "state" / "handoff-request.json").read_text())
+        self.assertEqual(Path(request["repo_root"]).resolve(), self.repo.resolve())
+
+    def test_unbalanced_markers_are_left_alone(self):
+        self.prepare_shared()
+        codex = self.home / ".codex" / "AGENTS.md"
+        codex.write_text("my rules\n<!-- agent-stack:begin -->\nold block, end marker deleted\nmore of my rules\n")
+        before = codex.read_text()
+        self.assertIn("conflict (unbalanced", self.run_cmd(["sync"]).stdout)
+        self.assertEqual(codex.read_text(), before)
+
+    def test_copy_mode_is_stable_with_symlinked_files(self):
+        self.prepare_shared()
+        (self.stack / "config.json").write_text(json.dumps({"agy_skills_mode": "copy"}))
+        skill = self.home / ".agents" / "skills" / "agent-handoff"
+        (self.home / "ref.md").write_text("shared reference\n")
+        (skill / "ref.md").symlink_to(self.home / "ref.md")
+        self.assertIn("copied", self.run_cmd(["sync"]).stdout)
+        second = self.run_cmd(["sync"]).stdout
+        self.assertNotIn("refreshed", second)
+
+    def test_nested_narrative_counts_as_written(self):
+        self.run_cmd(["handoff", "--cwd", str(self.repo)])
+        path = self.repo / "HANDOFF.md"
+        path.write_text(path.read_text().replace("- Done so far:\n", "- Done so far:\n  - refactored app.py\n"))
+        self.run_cmd(["handoff", "--cwd", str(self.repo)])
+        log = (self.stack / "logs" / "agentstack.log").read_text()
+        self.assertIn("agentmemory remember skipped", log)  # it was considered written and would be sent
+
+    def test_claude_ollama_env_mode_sets_context(self):
+        self.stack.mkdir(parents=True)
+        (self.stack / "config.json").write_text(json.dumps({"claude_ollama_mode": "env"}))
+        out = self.run_cmd(["switch", "--cwd", str(self.repo), "--pick", "claude-ollama", "--no-handoff"]).stdout
+        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=65536", out)
+
+    def test_launcher_is_valid_bash(self):
+        proc = self.run_cmd(["switch", "--cwd", str(self.repo), "--pick", "hermes", "--no-handoff"])
+        launcher = re.search(r"launcher written: (\S+)", proc.stdout).group(1)
+        check = subprocess.run(["bash", "-n", launcher], capture_output=True, text=True)
+        self.assertEqual(check.returncode, 0, check.stderr)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -57,4 +57,4 @@ Afterwards, paste the matching line from playbook section 11 into Codex, agy and
 | `agentstack install / uninstall --agent claude\|codex\|agy` | Adds or removes the hooks and status line (backs up the settings file, keeps symlinks and file permissions; uninstall restores your old status line). |
 | `agentstack doctor` | Checks services, ports exposed on your network, duplicate memory hooks, rule copies and more. |
 
-Tests: `python3 agent-stack/tests/test_agentstack.py` (40 tests, throwaway HOME, safe to run anywhere).
+Tests: `python3 agent-stack/tests/test_agentstack.py` (49 tests, throwaway HOME, safe to run anywhere).
