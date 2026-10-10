@@ -1,0 +1,9 @@
+# agent-stack: append to ~/.codex/config.toml. Defining a provider does not activate it;
+# your default stays on Codex's own ChatGPT login. Codex refuses to start this profile if the
+# variable named by env_key is empty, so export it in ~/.zshrc.
+[model_providers.omniroute]
+name = "OmniRoute"
+base_url = "http://127.0.0.1:20128/v1"
+env_key = "OMNIROUTE_CODEX_KEY"
+wire_api = "responses"
+requires_openai_auth = false

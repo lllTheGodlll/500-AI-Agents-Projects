@@ -1,0 +1,3 @@
+# agent-stack: save as ~/.codex/omniroute.config.toml and run `codex --profile omniroute`.
+model = "__FALLBACK_COMBO__"
+model_provider = "omniroute"

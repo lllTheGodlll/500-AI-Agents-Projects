@@ -1,0 +1,19 @@
+# agent-stack: merge into ~/.hermes/config.yaml by hand (do not paste over the file).
+# Put the key in ~/.hermes/.env as OMNIROUTE_HERMES_KEY=...
+providers:
+  omniroute:
+    api: http://127.0.0.1:20128/v1
+    key_env: OMNIROUTE_HERMES_KEY
+    transport: chat_completions
+
+# Shared skills, with approval before Hermes edits a skill in place (other agents use them too).
+skills:
+  external_dirs:
+    - ~/.agents/skills
+  write_approval: true
+
+# Fallback when the primary provider is rate-limited. Create it with `hermes fallback add`
+# (pick the omniroute provider) rather than typing it; the generated entry looks like:
+# fallback_providers:
+#   - provider: custom:omniroute
+#     model: __FALLBACK_COMBO__

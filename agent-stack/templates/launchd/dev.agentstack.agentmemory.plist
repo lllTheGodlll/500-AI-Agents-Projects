@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- agent-stack: runs the agentmemory daemon at login with a clean environment, so provider keys
+     exported in your shell (OPENAI_API_KEY, ANTHROPIC_API_KEY, ...) never reach it.
+     Replace __AGENTMEMORY_BIN__, __NODE_DIR__ and __HOME__. If the store used to live in a legacy
+     ./data/state_store.db, set WorkingDirectory to the folder that holds that data/ folder. Then:
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.agentstack.agentmemory.plist -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.agentstack.agentmemory</string>
+  <!-- env -i: the daemon gets only these variables, not whatever `launchctl setenv` put into the
+       login session. If the store is not in the default place, add AGENTMEMORY_DATA_DIR=/path
+       as one more string before __AGENTMEMORY_BIN__. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/env</string>
+    <string>-i</string>
+    <string>HOME=__HOME__</string>
+    <string>PATH=__NODE_DIR__:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <string>CI=1</string>
+    <string>__AGENTMEMORY_BIN__</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__HOME__/.agentmemory</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>__HOME__/.agents/stack/logs/agentmemory.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.agents/stack/logs/agentmemory.err.log</string>
+</dict>
+</plist>

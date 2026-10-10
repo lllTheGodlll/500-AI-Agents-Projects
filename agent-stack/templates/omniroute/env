@@ -1,0 +1,13 @@
+# agent-stack hardening for OmniRoute 3.8.x. Merge into the .env OmniRoute actually reads: DATA_DIR/.env
+# first (DATA_DIR is ~/.omniroute, or $XDG_CONFIG_HOME/omniroute when XDG_CONFIG_HOME is set), then
+# ~/.omniroute/.env. Restart OmniRoute afterwards. For Docker set APP_BIND_HOST=127.0.0.1 instead of HOST.
+# INITIAL_PASSWORD only applies on the very first boot: change the dashboard password in the dashboard.
+# npm installs listen on 0.0.0.0 without an API key by default: anyone on your network could
+# spend every connected account.
+HOST=127.0.0.1
+OMNIROUTE_SERVER_HOST=127.0.0.1
+REQUIRE_API_KEY=true
+# Skip an account before it returns 429 (raise the cutoff to 10-15% in Settings > Quota Preflight Cutoff).
+QUOTA_PREFLIGHT_CUTOFF_ENABLED=true
+# The memory layer (agentmemory + HANDOFF.md) owns handoffs; stop OmniRoute's own summaries.
+UNIVERSAL_CONTEXT_HANDOFF_ENABLED=false
